@@ -2,6 +2,14 @@
 #include <dw3000_hw.h>
 #include <dw3000_spi.h>
 #include <deca_probe_interface.h>
+#include "UWBFrame.h"
+
+//#define INITIATOR
+
+#define SPEED_OF_LIGHT 299702547
+
+#define INITIATOR_ADDRESS 0x4556
+#define RESPONDER_ADDRESS 0x4157
 
 #define DUMMY_ANTENNA_DELAY 16385
 
@@ -13,13 +21,6 @@
 #define PREAMBLE_TIME_OUT 65000
 
 #define RANGING_INTERVAL 1000
-
-#define BUFFER_SIZE 20
-static uint8_t buffer[BUFFER_SIZE];
-
-static uint8_t tx_poll_msg[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x21 };
-static uint8_t rx_resp_msg[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0x10, 0x02, 0, 0 };
-static uint8_t tx_final_msg[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 static dwt_config_t config = {
     5,                /* Channel number. */
@@ -42,32 +43,6 @@ static dwt_txconfig_t txconfig_options = {
     0xfdfdfdfd,
     0x0
 };
-
-uint64_t get_tx_timestamp_u64() {
-    uint8_t ts_tab[5];
-    uint64_t ts = 0;
-    int8_t i;
-    dwt_readtxtimestamp(ts_tab);
-    for (i = 4; i >= 0; i--)
-    {
-        ts <<= 8;
-        ts |= ts_tab[i];
-    }
-    return ts;
-}
-
-uint64_t get_rx_timestamp_u64() {
-    uint8_t ts_tab[5];
-    uint64_t ts = 0;
-    int8_t i;
-    dwt_readrxtimestamp(ts_tab);
-    for (i = 4; i >= 0; i--)
-    {
-        ts <<= 8;
-        ts |= ts_tab[i];
-    }
-    return ts;
-}
 
 void main(void) {
 	dw3000_hw_init();
@@ -101,67 +76,195 @@ void main(void) {
     dwt_setrxtimeout(RX_TIME_OUT);
     dwt_setpreambledetecttimeout(PREAMBLE_TIME_OUT);
 
-	uint8_t sequenceNumber = 0;
-	uint16_t frameSize;
-	uint32_t status;
+    uint32_t status;
+    uint8_t sequenceNumber = 0;
+
+#ifdef INITIATOR
 	uint64_t tx1TimeStamp;
 	uint64_t rxTimeStamp;
 	uint64_t tx2TimeStamp;
 
+    struct UWBFrame firstTxFrame = {
+        .frameControl = 0x8841,
+        .panId = 0xDECA,
+        .destinationAddress = RESPONDER_ADDRESS,
+        .sourceAddress = INITIATOR_ADRRESS,
+        .functionCode = 0x21
+    };
+
+    struct UWBDelayDataFrame secondTxFrame = { .baseFrame = firstTxFrame };
+    secondTxFrame.baseFrame.functionCode = 0x23;
+
+    struct UWBResponseFrame rxFrame;
+
+    uint32_t tx2Time;
+
 	while (true) {
-		tx_poll_msg[2] = sequenceNumber;
-        dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);  /* Zero offset in TX buffer. */
-        dwt_writetxfctrl(sizeof(tx_poll_msg) + FCS_LEN, 0, 1); /* Zero offset in TX buffer, ranging. */
+        firstTxFrame.sequenceNumber = sequenceNumber++;
+        
+        dwt_writetxdata(sizeof(firstTxFrame), &firstTxFrame, 0);
+        dwt_writetxfctrl(sizeof(firstTxFrame) + FCS_LEN, 0, 1);
 
 		dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 
 		while (!((status = dwt_readsysstatuslo()) & (DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {}
 
-		sequenceNumber++;
-
 		if (status & DWT_INT_RXFCG_BIT_MASK) {
 			dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK | DWT_INT_TXFRS_BIT_MASK);
 
-			frameSize = dwt_getframelength();
-            if (frameSize <= BUFFER_SIZE)
-                dwt_readrxdata(buffer, frameSize, 0);
+            if (dwt_getframelength() >= sizeof(rxFrame)) {
+                dwt_readrxdata(&rxFrame, sizeof(rxFrame), 0);
 
-			buffer[2] = 0;
-            if (memcmp(buffer, rx_resp_msg, 10) == 0) {
-				uint32_t final_tx_time;
+                if (
+                    rxFrame.baseFrame.frameControl == 0x8841 &&
+                    rxFrame.baseFrame.panId == 0xDECA &&
+                    rxFrame.baseFrame.destinationAddress == INITIATOR_ADDRESS &&
+                    rxFrame.baseFrame.sourceAddress == RESPONDER_ADDRESS &&
+                    rxFrame.baseFrame.functionCode == 0x10 &&
+                    rxFrame.activityCode == 0x02
+                ) {
+                    tx1TimeStamp = 0;
+                    tx1TimeStamp |= dwt_readtxtimestamphi32();
+                    tx1TimeStamp <<= 8;
+                    tx1TimeStamp |= dwt_readtxtimestamplo32();
 
-                tx1TimeStamp = get_tx_timestamp_u64();
-                rxTimeStamp = get_rx_timestamp_u64();
+                    rxTimeStamp = 0;
+                    rxTimeStamp |= dwt_readrxtimestamphi32();
+                    rxTimeStamp <<= 8;
+                    rxTimeStamp |= dwt_readrxtimestamplo32();
 
-                final_tx_time = (rxTimeStamp + (TX_DELAY * UUS_TO_DWT_TIME)) >> 8;
-                dwt_setdelayedtrxtime(final_tx_time);
+                    tx2Time = (rxTimeStamp + (TX_DELAY * UUS_TO_DWT_TIME)) >> 8;
+                    
+                    dwt_setdelayedtrxtime(tx2Time);
 
-                tx2TimeStamp = (((uint64_t)(final_tx_time & 0xFFFFFFFEUL)) << 8) + DUMMY_ANTENNA_DELAY;
+                    tx2TimeStamp = (((uint64_t)(tx2Time & 0xFFFFFFFEUL)) << 8) + DUMMY_ANTENNA_DELAY;
 
-				uint32_t* assigner = &(tx_final_msg[10]);
-				*assigner = (uint32_t)tx1TimeStamp;
-				assigner = &(tx_final_msg[14]);
-				*assigner = (uint32_t)rxTimeStamp;
-				assigner = &(tx_final_msg[18]);
-				*assigner = (uint32_t)tx2TimeStamp;
+                    secondTxFrame.tx1TimeStamp = (uint32_t)tx1TimeStamp;
+                    secondTxFrame.rxTimeStamp = (uint32_t)rxTimeStamp;
+                    secondTxFrame.tx2TimeStamp = (uint32_t)tx2TimeStamp;
 
-                tx_final_msg[2] = sequenceNumber;
-                dwt_writetxdata(sizeof(tx_final_msg), tx_final_msg, 0);
-                dwt_writetxfctrl(sizeof(tx_final_msg) + FCS_LEN, 0, 1);
+                    secondTxFrame.baseFrame.sequenceNumber = sequenceNumber++;
+                    
+                    dwt_writetxdata(sizeof(secondTxFrame), &secondTxFrame, 0);
+                    dwt_writetxfctrl(sizeof(secondTxFrame) + FCS_LEN, 0, 1);
 
-                if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS)
-                {
-					while (!(dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK)) {}
+                    if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS) {
+                        while (!(dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK)) {}
 
-                    dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
-
-                    sequenceNumber++;
+                        dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+                    }
                 }
-			}
-		} else {
+            }
+		} else
 			dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR | DWT_INT_TXFRS_BIT_MASK);
-		}
 
 		k_msleep(RANGING_INTERVAL);
 	}
+#else
+    struct UWBFrame firstRxFrame;
+    struct UWBDelayDataFrame secondRxFrame;
+    uint64_t firstRxTimeStamp;
+    uint64_t txTimeStamp;
+    uint64_t secondRxTimeStamp;
+    uint64_t txTime;
+    double firstLoopDuration;
+    double firstProcessingDuration;
+    double secondLoopDuration;
+    double secondProcessingDuration;
+    double timeOfFlight;
+    double distance;
+
+    struct UWBResponseFrame txFrame = {
+        .baseFrame = {
+            .frameControl = 0x8841,
+            .panId = 0xDECA,
+            .destinationAddress = INITIATOR_ADDRESS,
+            .sourceAddress = RESPONDER_ADDRESS,
+            .functionCode = 0x10
+        },
+        .activityCode = 0x02
+    };
+
+    while (true) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+        while (!((status = dwt_readsysstatuslo()) & (DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {}
+        
+        if (status & DWT_INT_RXFCG_BIT_MASK) {
+            dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+
+            if (dwt_getframelength() >= sizeof(firstRxFrame)) {
+                dwt_readrxdata(&firstRxFrame, sizeof(firstRxFrame), 0);
+                if (
+                    firstRxFrame.frameControl == 0x8841 &&
+                    firstRxFrame.panId == 0xDECA &&
+                    firstRxFrame.destinationAddress == RESPONDER_ADDRESS &&
+                    firstRxFrame.sourceAddress == INITIATOR_ADDRESS &&
+                    firstRxFrame.functionCode == 0x21
+                ) {
+                    firstRxTimeStamp = 0;
+                    firstRxTimeStamp |= dwt_readrxtimestamphi32();
+                    firstRxTimeStamp <<= 8;
+                    firstRxTimeStamp |= dwt_readrxtimestamplo32();
+
+                    txTime = (firstRxTimeStamp + (TX_DELAY * UUS_TO_DWT_TIME)) >> 8;
+                    
+                    dwt_setdelayedtrxtime(txTime);
+
+                    txFrame.baseFrame.sequenceNumber = sequenceNumber;
+                    
+                    dwt_writetxdata(sizeof(txFrame), &txFrame, 0);
+                    dwt_writetxfctrl(sizeof(txFrame) + FCS_LEN, 0, 1);
+                    
+                    if (dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED) != DWT_ERROR) {
+                        while (!((status = dwt_readsysstatuslo()) & (DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR))) {}
+
+                        sequenceNumber++;
+
+                        if (status & DWT_INT_RXFCG_BIT_MASK) {
+                            dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK | DWT_INT_TXFRS_BIT_MASK);
+
+                            if (dwt_getframelength() >= sizeof(secondRxFrame)) {
+                                dwt_readrxdata(&secondRxFrame, sizeof(secondRxFrame), 0);
+                                if (
+                                    secondRxFrame.baseFrame.frameControl == 0x8841 &&
+                                    secondRxFrame.baseFrame.panId == 0xDECA &&
+                                    secondRxFrame.baseFrame.destinationAddress == RESPONDER_ADDRESS &&
+                                    secondRxFrame.baseFrame.sourceAddress == INITIATOR_ADDRESS &&
+                                    secondRxFrame.baseFrame.functionCode == 0x23
+
+                                ) {
+                                    txTimeStamp = 0;
+                                    txTimeStamp |= dwt_readtxtimestamphi32();
+                                    txTimeStamp <<= 8;
+                                    txTimeStamp |= dwt_readtxtimestamplo32();
+
+                                    secondRxTimeStamp = 0;
+                                    secondRxTimeStamp |= dwt_readrxtimestamphi32();
+                                    secondRxTimeStamp <<= 8;
+                                    secondRxTimeStamp |= dwt_readrxtimestamplo32();
+
+                                    firstLoopDuration = (double)(secondRxFrame.rxTimeStamp - secondRxFrame.tx1TimeStamp);
+                                    firstProcessingDuration = (double)(((uint32_t)txTimeStamp) - ((uint32_t)firstRxTimeStamp));
+                                    secondLoopDuration = (double)(((uint32_t)secondRxTimeStamp) - ((uint32_t)txTimeStamp));
+                                    secondProcessingDuration = (double)(secondRxFrame.tx2TimeStamp - secondRxFrame.rxTimeStamp);
+
+                                    timeOfFlight = (firstLoopDuration * secondLoopDuration - firstProcessingDuration * secondProcessingDuration) /
+                                                   (firstLoopDuration + secondLoopDuration + firstProcessingDuration + secondProcessingDuration) *
+                                                   DWT_TIME_UNITS;
+
+                                    distance = timeOfFlight * SPEED_OF_LIGHT;
+
+                                    printf("Distance = %3.2f m\n", distance);
+                                }
+                            }
+                        } else
+                            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+                    }
+                }
+            }
+        } else
+            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+    }
+#endif
 }
