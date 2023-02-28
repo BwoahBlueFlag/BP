@@ -1,0 +1,24 @@
+&arduino_spi {
+    status = "okay";
+    cs-gpios = <&arduino_header 16 GPIO_ACTIVE_LOW>; /* D10 */
+
+    dws3000@0 {
+        compatible = "decawave,dw3000";
+        label = "DWS3000";
+        spi-max-frequency = <1000000>;
+        reg = <0>;
+        wakeup-gpios  = <&arduino_header 15 GPIO_ACTIVE_HIGH>; /* D9 */
+        irq-gpios     = <&arduino_header 14 GPIO_ACTIVE_HIGH>; /* D8 */
+        reset-gpios   = <&arduino_header 13 GPIO_ACTIVE_LOW>; /* D7 */
+        spi-pol-gpios = <&arduino_header  7 GPIO_ACTIVE_LOW>; /* D1 */
+        spi-pha-gpios = <&arduino_header  6 GPIO_ACTIVE_LOW>; /* D0 */
+    };
+};
+
+/*
+ *   By default config Zephyr will P1.01 and P1.02 for UART1.
+ *   Disable UART1 so that DWM3000 can use them for SPI3 Polarity and Phase pins.
+ */
+ arduino_serial: &uart1 {
+	status = "disabled";
+};
